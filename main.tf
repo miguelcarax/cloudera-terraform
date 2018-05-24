@@ -1,12 +1,58 @@
+#############
+# TERRAFORM #
+#############
+
 provider "aws" {
-  region = "eu-west-1"
+  region = "eu-west-1" # Ireland
 }
 
-resource "aws_key_pair" "terraform" {
-  key_name_prefix = "terraform-"
-  public_key      = "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQC0dFDv4t1IAXyawNCgu0OC0JpfqA8Pza4/FalTiZqs3zi3gTHYyWUqgfujFkFz9NjUWs9bYYhbdiiyIRQclG2Wm14fjQT4Kug3zxzitS5lR+/aL7i8s7QvEw8BOngINDvI+GHoM369Jku98YWPeXF9xiy+dPH2ZA3dMhR4ub+tXZvT/Dgiy3TsJkcS+xFGQa+haD/twy7jSxBBeaGuhRsK5u/WPF/4WisBcjAkK75yCphgWSeB+t/kZIWbpSABtVXbpnrCkVEeS3kIDHS+1Xbn3J96kSfxmYm6gb7zCpuQqTapHQ98GytwBEn2bdTNWfPH6T1RyKJh75UwfAIZZ8Bh miguel@PORTROBERT135"
+
+#############
+# VARIABLES #
+#############
+
+variable "key_name" {
+  description = "Nombre de la pareja de claves definida en Amazon"
+  default     = "terraform"
 }
 
+variable "ami" {
+  description = "Amazon Linux AMI 2018.03.0 (HVM), SSD Volume Type"
+  default    = "ami-ca0135b3" # eu-west-1 - Irlanda
+}
+
+variable "instance_type" {
+  description = "Free tier instance"
+  default     = "t2.micro"
+}
+
+variable "domain" {
+  description = "Cluster network domain"
+  default     = "caf.net"
+}
+
+variable "hostname" {
+  type        = "map"
+  default     = {
+    "master"  = "cdh-master"
+    "worker"  = "cdh-worker"
+    "gateway" = "cdh-gateway"
+  }
+}
+
+variable "count" {
+  type    = "map"
+  default = {
+    "master"  = 1 
+    "worker"  = 1
+    "gateway" = 1
+  }
+}
+
+
+##############
+# NETWORKING # 
+##############
 
 resource "aws_internet_gateway" "gateway" {
   vpc_id  = "${aws_vpc.main.id}"
@@ -20,8 +66,35 @@ resource "aws_internet_gateway" "gateway" {
 /*resource "aws_nat_gateway" "nat_gateway" {
   allocation_id = ""
   subnet_id     = ""
-  
 }*/
+
+resource "aws_route53_zone" "main" {
+  name = "${var.domain}"
+
+  tags {
+    Environment = "test"
+  }
+}
+
+resource "aws_route53_record" "master" {
+  zone_id = "${aws_route53_zone.main.id}"
+  name    = "${lookup(var.hostname, "master")}${count.index}.${var.domain}"
+  type    = "A"
+  ttl     = 300
+  records = ["${element(aws_instance.master.*.private_ip, count.index)}"]
+
+  count = "${lookup(var.count, "master")}"
+}
+
+resource "aws_route53_record" "gateway" {
+  zone_id = "${aws_route53_zone.main.id}"
+  name    = "${lookup(var.hostname, "gateway")}${count.index}.${var.domain}"
+  type    = "A"
+  ttl     = 300
+  records = ["${element(aws_instance.gateway.*.private_ip, count.index)}"]
+
+  count = "${lookup(var.count, "gateway")}"
+}
 
 # Default "local" routing it's implicit
 resource "aws_route_table" "main" {
@@ -81,6 +154,7 @@ resource "aws_vpc" "main" {
   }
 }
 
+# FIXME No direct access to private subnet
 resource "aws_subnet" "private" {
   cidr_block             = "10.0.0.0/24"
   vpc_id                 = "${aws_vpc.main.id}"
@@ -112,11 +186,23 @@ resource "aws_route_table_association" "public_public" {
   route_table_id = "${aws_route_table.public.id}"
 }
 
+###################
+# SECURITY GROUPS # 
+###################
 
-# Por defecto el security group que creamos no permite ningún tipo de tráfico
+# Por defecto el security group que crea terraform no permite ningún tipo de tráfico
 resource "aws_security_group" "ssh" {
   name        = "main"
   vpc_id      = "${aws_vpc.main.id}"
+
+  # FIXME SECURITY RISK
+  ingress {
+    description = "Allow ALL traffic"
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
 
   ingress {
     description = "Enable SSH"
@@ -126,22 +212,25 @@ resource "aws_security_group" "ssh" {
     cidr_blocks = ["0.0.0.0/0"]
   }
 
+  # FIXME
   ingress {
     description = "Allow PING from the outside"
     from_port   = "-1"
     to_port     = "-1"
-    protocol    = "ICMP"
+    protocol    = "icmp"
     cidr_blocks = ["0.0.0.0/0"]
   }
 
+  # TODO Crear otro security group para within the cluster
   ingress {
     description = "Allow ALL inbound traffic within the cluster"
     from_port   = 0
     to_port     = 0
     protocol    = "-1"
-    cidr_blocks = ["${aws_subnet.private.cidr_block}"]
+    cidr_blocks = ["${aws_subnet.public.cidr_block}", "${aws_subnet.private.cidr_block}"]
   }
 
+  # TODO Crear otro security group para within the cluster
   egress {
     description = "Allow ALL outbound traffic"
     from_port   = 0
@@ -152,42 +241,69 @@ resource "aws_security_group" "ssh" {
 }
 
 
-resource "aws_instance" "gw" {
-  ami                          = "ami-895e69f0"
-  instance_type                = "t2.micro"
-  key_name                     = "${aws_key_pair.terraform.key_name}"
+#############
+# INSTANCES # 
+#############
+
+resource "aws_instance" "gateway" {
+  ami                          = "${var.ami}"
+  instance_type                = "${var.instance_type}"
   #associate_public_ip_address = "true"          # Asocia una IP pública a la instancia
 
-  # FIXME subnet_id                    = "${aws_subnet.public.id}"
-  subnet_id               = "${aws_subnet.private.id}"
+  # FIXME subnet_id            = "${aws_subnet.public.id}"
+  key_name                     = "${var.key_name}"
+  subnet_id                    = "${aws_subnet.private.id}"
   vpc_security_group_ids       = ["${aws_security_group.ssh.id}"]
 
-  user_data=<<-EOF
-  nohup python -m SimpleHTTPServer 8080 &
-  EOF
-
   tags {
-    Name = "Gateway"
+    Name = "Gateway-${count.index}"
+    Role = "Gateway"
   }
+
+  count = "${lookup(var.count, "gateway")}"
+
 }
 
 resource "aws_instance" "master" {
-  ami                     = "ami-895e69f0"
-  instance_type           = "t2.micro"
-  key_name                = "${aws_key_pair.terraform.key_name}"
+  ami                    = "${var.ami}"
+  instance_type          = "${var.instance_type}"
 
-  subnet_id               = "${aws_subnet.private.id}"
-  #vpc_security_group_ids = ["${aws_security_group.ssh.id}"]
+  key_name               = "${var.key_name}"
+  subnet_id              = "${aws_subnet.private.id}"
+  vpc_security_group_ids = ["${aws_security_group.ssh.id}"]
 
   tags {
-    Name = "Master"
+    Name = "Master-${count.index}"
+    Role = "Master"
+  }
+
+  count = "${lookup(var.count, "master")}"
+
+}
+
+################
+# DATA SOURCES #
+################
+
+data "aws_instances" "all" { }
+
+data "template_file" "etc_hosts" {
+  template = "${file(etc/hosts)}"
+
+  vars {
+
   }
 }
 
-output "gw_dns" {
-  value = "${aws_instance.gw.public_dns}"
+
+###########
+# OUTPUTS #
+###########
+
+output "gateway_dns" {
+  value = "${aws_instance.gateway.*.public_dns}"
 }
 
 output "master_dns" {
-  value = "${aws_instance.master.public_dns}"
+  value = "${aws_instance.master.*.public_dns}"
 }
