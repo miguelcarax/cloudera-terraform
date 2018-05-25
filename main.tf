@@ -6,6 +6,11 @@ provider "aws" {
   region = "eu-west-1" # Ireland
 }
 
+################
+# DATA SOURCES #
+################
+
+
 
 #############
 # VARIABLES #
@@ -18,7 +23,7 @@ variable "key_name" {
 
 variable "ami" {
   description = "Amazon Linux AMI 2018.03.0 (HVM), SSD Volume Type"
-  default    = "ami-ca0135b3" # eu-west-1 - Irlanda
+  default     = "ami-ca0135b3" # eu-west-1 - Irlanda
 }
 
 variable "instance_type" {
@@ -32,16 +37,14 @@ variable "domain" {
 }
 
 variable "hostname" {
-  type        = "map"
-  default     = {
+  default = {
     "master"  = "cdh-master"
     "worker"  = "cdh-worker"
     "gateway" = "cdh-gateway"
   }
 }
 
-variable "count" {
-  type    = "map"
+variable "num" {
   default = {
     "master"  = 1 
     "worker"  = 1
@@ -54,28 +57,7 @@ variable "count" {
 # NETWORKING # 
 ##############
 
-resource "aws_internet_gateway" "gateway" {
-  vpc_id  = "${aws_vpc.main.id}"
-
-  tags {
-    Name = "Internet gateway"
-  }
-}
-
-# TODO
-/*resource "aws_nat_gateway" "nat_gateway" {
-  allocation_id = ""
-  subnet_id     = ""
-}*/
-
-resource "aws_route53_zone" "main" {
-  name = "${var.domain}"
-
-  tags {
-    Environment = "test"
-  }
-}
-
+### DNS
 resource "aws_route53_record" "master" {
   zone_id = "${aws_route53_zone.main.id}"
   name    = "${lookup(var.hostname, "master")}${count.index}.${var.domain}"
@@ -94,6 +76,58 @@ resource "aws_route53_record" "gateway" {
   records = ["${element(aws_instance.gateway.*.private_ip, count.index)}"]
 
   count = "${lookup(var.count, "gateway")}"
+}
+
+resource "aws_route53_zone" "main" {
+  name = "${var.domain}"
+
+  tags {
+    Environment = "test"
+  }
+}
+resource "aws_internet_gateway" "gateway" {
+  vpc_id  = "${aws_vpc.main.id}"
+
+  tags {
+    Name = "Internet gateway"
+  }
+}
+
+# TODO
+/*resource "aws_nat_gateway" "nat_gateway" {
+  allocation_id = ""
+  subnet_id     = ""
+}*/
+
+
+resource "aws_vpc" "main" {
+  cidr_block           = "10.0.0.0/16"
+  enable_dns_support   = "true" # default: true
+  enable_dns_hostnames = "true" # Instances receive a hostname, default: false
+
+  tags {
+    Name = "main"
+  }
+}
+
+resource "aws_subnet" "private" {
+  cidr_block             = "10.0.0.0/24"
+  vpc_id                 = "${aws_vpc.main.id}"
+  #map_public_ip_on_launch = "true" # Asigna una IP pública a las instancias asociadas
+
+  tags {
+    Name = "private"
+  }
+}
+
+resource "aws_subnet" "public" {
+  cidr_block = "10.0.1.0/24"
+  vpc_id     = "${aws_vpc.main.id}"
+  map_public_ip_on_launch = "true" # Asigna una IP pública a las instancias asociadas
+
+  tags {
+    Name = "public"
+  }
 }
 
 # Default "local" routing it's implicit
@@ -144,36 +178,6 @@ resource "aws_route_table" "private" {
   }
 }
 
-resource "aws_vpc" "main" {
-  cidr_block           = "10.0.0.0/16"
-  enable_dns_support   = "true" # default: true
-  enable_dns_hostnames = "true" # Instances receive a hostname, default: false
-
-  tags {
-    Name = "main"
-  }
-}
-
-# FIXME No direct access to private subnet
-resource "aws_subnet" "private" {
-  cidr_block             = "10.0.0.0/24"
-  vpc_id                 = "${aws_vpc.main.id}"
-  map_public_ip_on_launch = "true" # Asigna una IP pública a las instancias asociadas
-
-  tags {
-    Name = "private"
-  }
-}
-
-resource "aws_subnet" "public" {
-  cidr_block = "10.0.3.0/24"
-  vpc_id     = "${aws_vpc.main.id}"
-  map_public_ip_on_launch = "true" # Asigna una IP pública a las instancias asociadas
-
-  tags {
-    Name = "public"
-  }
-}
 
 # Asociar la tabla de rutas con la subnet
 resource "aws_route_table_association" "private_private" {
@@ -190,22 +194,46 @@ resource "aws_route_table_association" "public_public" {
 # SECURITY GROUPS # 
 ###################
 
-# Por defecto el security group que crea terraform no permite ningún tipo de tráfico
-resource "aws_security_group" "ssh" {
-  name        = "main"
-  vpc_id      = "${aws_vpc.main.id}"
+resource "aws_security_group" "internal" {
+  name   = "internal"
+  vpc_id = "${aws_vpc.main.id}"
 
-  # FIXME SECURITY RISK
+  # Default no ingress
   ingress {
-    description = "Allow ALL traffic"
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    self        = "true" # The security group itself will be added as a source
+  }
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"] # Allow outbound traffic to internet
+  }
+
+  tags {
+    Name = "Internal Traffic"
+  }
+}
+
+# NOT ALLOWED TRAFFIC BY DEFAULT
+resource "aws_security_group" "external" {
+  name   = "external"
+  vpc_id = "${aws_vpc.main.id}"
+
+  /*** FIXME
+  ingress {
     from_port   = 0
     to_port     = 0
     protocol    = "-1"
     cidr_blocks = ["0.0.0.0/0"]
   }
+  ***/
 
   ingress {
-    description = "Enable SSH"
+    description = "Allow SSH from the outside"
     from_port   = 22
     to_port     = 22
     protocol    = "tcp"
@@ -221,22 +249,15 @@ resource "aws_security_group" "ssh" {
     cidr_blocks = ["0.0.0.0/0"]
   }
 
-  # TODO Crear otro security group para within the cluster
-  ingress {
-    description = "Allow ALL inbound traffic within the cluster"
+  egress {
     from_port   = 0
     to_port     = 0
     protocol    = "-1"
-    cidr_blocks = ["${aws_subnet.public.cidr_block}", "${aws_subnet.private.cidr_block}"]
+    cidr_blocks = ["0.0.0.0/0"]
   }
 
-  # TODO Crear otro security group para within the cluster
-  egress {
-    description = "Allow ALL outbound traffic"
-    from_port   = 0
-    to_port     = 0
-    protocol    = "-1" # ALL protocols
-    cidr_blocks = ["0.0.0.0/0"]
+  tags {
+    Name = "External Traffic"
   }
 }
 
@@ -252,8 +273,8 @@ resource "aws_instance" "gateway" {
 
   # FIXME subnet_id            = "${aws_subnet.public.id}"
   key_name                     = "${var.key_name}"
-  subnet_id                    = "${aws_subnet.private.id}"
-  vpc_security_group_ids       = ["${aws_security_group.ssh.id}"]
+  subnet_id                    = "${aws_subnet.public.id}"
+  vpc_security_group_ids       = ["${aws_security_group.internal.id}", "${aws_security_group.external.id}"]
 
   tags {
     Name = "Gateway-${count.index}"
@@ -270,7 +291,7 @@ resource "aws_instance" "master" {
 
   key_name               = "${var.key_name}"
   subnet_id              = "${aws_subnet.private.id}"
-  vpc_security_group_ids = ["${aws_security_group.ssh.id}"]
+  vpc_security_group_ids = ["${aws_security_group.internal.id}"]
 
   tags {
     Name = "Master-${count.index}"
@@ -281,20 +302,21 @@ resource "aws_instance" "master" {
 
 }
 
-################
-# DATA SOURCES #
-################
+resource "aws_instance" "worker" {
+  ami           = "${var.ami}"
+  instance_type = "${var.instance_type}"
 
-data "aws_instances" "all" { }
+  key_name               = "${var.key_name}"
+  subnet_id              = "${aws_subnet.private.id}"
+  vpc_security_group_ids = ["${aws_security_group.internal.id}"]
 
-data "template_file" "etc_hosts" {
-  template = "${file(etc/hosts)}"
-
-  vars {
-
+  tags {
+    Name = "Worker-${count.index}"
+    Role = "Worker"
   }
-}
 
+  count = "${lookup(var.count, "worker")}"
+}
 
 ###########
 # OUTPUTS #
@@ -306,4 +328,8 @@ output "gateway_dns" {
 
 output "master_dns" {
   value = "${aws_instance.master.*.public_dns}"
+}
+
+output "worker_dns" {
+  value = "${aws_instance.worker.*.public_dns}"
 }
