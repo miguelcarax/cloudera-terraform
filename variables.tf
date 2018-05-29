@@ -32,9 +32,9 @@ variable "hostname" {
 
 variable "count" {
   default = {
-    "master"  = 1 
-    "worker"  = 1
     "gateway" = 1
+    "master"  = 3 
+    "worker"  = 3
   }
 }
 
